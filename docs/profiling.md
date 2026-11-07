@@ -38,6 +38,38 @@ open /tmp/metal-trace/*.gputrace
 
 > The `--profiler-config.profiler=torch` value is mandatory for vLLM's config validation but ignored by vllm-metal — `MetalWorker.profile()` always uses Metal frame capture regardless of the value.
 
+## Server-side scheduler timing trace
+
+For request sweeps, vllm-metal also provides an opt-in trace API compatible
+with the fields consumed by Score's `profile_chat_sweep.py`. It measures the
+paged runner path from preparation through GPU completion, sampling, chat
+render/tokenization preparation, and incremental detokenization. The forward
+interval includes CPU preparation and submission as well as GPU execution;
+use Instruments to separate those costs. It forces a Metal synchronization
+after each forward and disables the decode pipeline, so this mode changes
+overlap and should explain a run, not report unprofiled throughput.
+
+The HTTP routes are an endpoint plugin and must be explicitly enabled. Because
+vLLM uses `VLLM_PLUGINS` as an allowlist across plugin groups, retain the
+vllm-metal plugins needed by the model when enabling the timing endpoint:
+
+```bash
+export VLLM_PLUGINS=metal,metal_model_metadata,metal_draft_context_limit,gguf_metal,metal_timing
+export VLLM_METAL_TRACE_TIMING=1
+vllm serve <model> --host 127.0.0.1
+```
+
+The sweep's `/debug/trace`, `/debug/scheduler_metrics`, `/debug/trace/steps`,
+and `/debug/trace/requests` routes are exposed. Step records include completed
+prefill request IDs, accumulated forward and sampling milliseconds, decode
+request IDs, sampled token counts, and monotonic step timestamps. Request
+records include chat rendering/tokenization preparation and incremental token
+detokenization time. The scheduler endpoint reports active HTTP inference
+requests and total runner steps; vLLM does not expose its internal waiting
+queue count through this plugin, so the `waiting` field is omitted. A
+profiling run is limited to the runner's most recent 100,000 recorded steps
+and request records.
+
 ## Programmatic API
 
 ```python
@@ -209,4 +241,3 @@ open /tmp/run.trace
 ```
 
 Trace size is typically 50–150 MB regardless of run length. **Caveat**: Apple's Metal System Trace template was designed for graphics workloads, so MLX's compute kernels don't surface as named encoders in the Metal Application track. You get GPU utilization and CPU sampling, **not per-kernel timing** — for that, use frame capture's Profile pane.
-

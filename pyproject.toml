@@ -113,6 +113,9 @@ metal_model_metadata = "vllm_metal.compat:register_model_compat"
 # Keeps the target context for a shorter draft model on the MLX runner.
 metal_draft_context_limit = "vllm_metal.patches.draft_context_limit:register"
 
+[project.entry-points."vllm.endpoint_plugins"]
+metal_timing = "vllm_metal.profiling:create_plugin"
+
 [tool.setuptools]
 include-package-data = false
 

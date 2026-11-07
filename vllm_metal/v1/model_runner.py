@@ -14,6 +14,7 @@ Key contracts:
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from importlib.metadata import entry_points
+import time
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias, cast
 
 import mlx.core as mx
@@ -138,6 +139,7 @@ from vllm_metal.v1.spec_decode import (
     SpeculativeDecodeController,
 )
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
+from vllm_metal.v1.timing import MetalTimingTrace
 
 if TYPE_CHECKING:
     from vllm_metal.moe_offload import ExpertStore
@@ -480,6 +482,18 @@ class MetalModelRunner:
         # Async forward state: stashed by execute_model, consumed by
         # sample_tokens (mirrors upstream's execute_model_state pattern).
         self._execute_model_state: _PagedForwardState | None = None
+        self._timing_trace = MetalTimingTrace()
+        self._timing_pending: (
+            tuple[
+                int,
+                int,
+                float,
+                list[PrefillRequest],
+                list[tuple[str, RequestState]],
+                set[str],
+            ]
+            | None
+        ) = None
         # What a failed sample_tokens call raised (type and message); the next
         # execute_model raises on it.
         self._sample_failure: str | None = None
@@ -1484,6 +1498,10 @@ class MetalModelRunner:
         Stashes all state needed by ``sample_tokens`` in
         ``_execute_model_state`` (mirrors upstream's pattern).
         """
+        timing_start_ns = 0
+        timing_step_id = -1
+        if self._timing_trace.enabled:
+            timing_step_id, timing_start_ns = self._timing_trace.begin_step()
         decode_segments = self._spec_decode_controller.build_decode_segments(
             decode_reqs,
             self._spec_decode_controller.active_spec_decode_tokens(scheduler_output),
@@ -1770,6 +1788,18 @@ class MetalModelRunner:
                 forward_outputs.append(target_hidden_states)
             self._submit_paged_forward_outputs(*forward_outputs)
 
+        if self._timing_trace.enabled:
+            mx.synchronize()
+            forward_end_ns = time.perf_counter_ns()
+            self._timing_pending = (
+                timing_step_id,
+                timing_start_ns,
+                (forward_end_ns - timing_start_ns) / 1e6,
+                list(prefill_reqs),
+                list(decode_reqs),
+                set(scheduler_output.finished_req_ids),
+            )
+
         # `cu_seqlens` keeps describing the packed hidden states, which the
         # pooler and the Gemma4 MTP proposer index; `logits_layout.cu_seqlens`
         # describes the tensor the head actually produced.
@@ -1819,7 +1849,9 @@ class MetalModelRunner:
         adapter = self._multimodal_adapter
         mm_forward_forced = self._mm_forward_forced(adapter)
         capabilities = RunnerCapabilities(
-            pipeline_enabled=envs.VLLM_METAL_DECODE_PIPELINE,
+            pipeline_enabled=(
+                envs.VLLM_METAL_DECODE_PIPELINE and not self._timing_trace.enabled
+            ),
             use_async_scheduling=self.use_async_scheduling,
             paged_runtime_active=self._paged_attention_runtime is not None,
             is_pooling=self._is_pooling,
@@ -3268,9 +3300,40 @@ class MetalModelRunner:
         On pipeline-eligible steps the sync itself is deferred one step:
         a lazy native sample is submitted and an async output is returned.
         """
+        sample_start = time.perf_counter()
         try:
-            return self._sample_tokens(grammar_output)
+            output = self._sample_tokens(grammar_output)
+            if self._timing_pending is not None:
+                (
+                    step_id,
+                    start_ns,
+                    forward_ms,
+                    prefill_reqs,
+                    decode_reqs,
+                    finished_reqs,
+                ) = self._timing_pending
+                self._timing_pending = None
+                sampled = getattr(output, "sampled_token_ids", None)
+                sampled_tokens = (
+                    sum(len(row) for row in sampled)
+                    if isinstance(sampled, list)
+                    else 0
+                )
+                sample_end_ns = time.perf_counter_ns()
+                self._timing_trace.record_step(
+                    step_id=step_id,
+                    start_ns=start_ns,
+                    end_ns=sample_end_ns,
+                    prefill_reqs=prefill_reqs,
+                    decode_reqs=decode_reqs,
+                    forward_ms=forward_ms,
+                    sampling_ms=(time.perf_counter() - sample_start) * 1000,
+                    sampled_tokens=sampled_tokens,
+                    finished_reqs=finished_reqs,
+                )
+            return output
         except Exception as exc:
+            self._timing_pending = None
             # Under async scheduling the engine dispatches the next
             # execute_model before it reads this failure; that step raises it
             # instead of running on request state the sample never updated.
